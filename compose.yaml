@@ -1,41 +1,80 @@
-# Clients are idle containers; run.sh starts emqtt-bench and netem inside them.
-x-client: &client
+# One run of one test. The settings come from a test file in examples/:
+#   docker compose --env-file examples/lan.env up --build --exit-code-from publisher
+# Order: broker listening, subscriber subscribed, publishers. The run ends when the publisher container exits.
+
+# Network profile: QDISC from the test file is set on pub0 at both ends of the publisher link
+# (publisher container and broker), so it acts once per direction. delay = RTT / 2 where a source gives an RTT.
+# netem syntax: delay MEAN JITTER CORRELATION, loss PERCENT CORRELATION. Without "distribution" the jitter is
+# uniform in MEAN +/- JITTER; with "distribution normal" its sigma is JITTER. No link rate is set:
+# bandwidth is a measured output.
+
+x-node: &node
   build: .
-  image: mqtt-bench-client
-  command: sleep infinity
-  volumes: [./certs:/certs:ro, ./netem.sh:/netem.sh:ro]
+  image: mqtt-tls-vs-quic
+  volumes:
+    - ./certs:/certs:ro
+    - ./${RESULTS}:/results
+  environment:
+    SSLKEYLOGFILE: ${TLS_KEY_LOG} # TLS secrets for decrypting a capture; empty = not written
 
 services:
   mqtt-broker:
-    image: emqx/emqx:6.3.2
-    networks: [pub, sub]
+    <<: *node
+    networks:
+      publishers: {interface_name: pub0}
+      subscriber: {interface_name: sub0}
+    cap_add: [NET_ADMIN]
     ulimits: {nofile: 1048576}
-    volumes: [./certs:/certs:ro]
-    environment:
-      EMQX_LISTENERS__TCP__DEFAULT__ENABLE: "false"
-      EMQX_LISTENERS__WS__DEFAULT__ENABLE: "false"
-      EMQX_LISTENERS__WSS__DEFAULT__ENABLE: "false"
-      EMQX_LISTENERS__SSL__DEFAULT__SSL_OPTIONS__VERSIONS: '["tlsv1.3"]'
-      EMQX_LISTENERS__SSL__DEFAULT__SSL_OPTIONS__CERTFILE: /certs/server.pem
-      EMQX_LISTENERS__SSL__DEFAULT__SSL_OPTIONS__KEYFILE: /certs/server.key
-      EMQX_LISTENERS__QUIC__DEFAULT__ENABLE: "true"
-      EMQX_LISTENERS__QUIC__DEFAULT__SSL_OPTIONS__CERTFILE: /certs/server.pem
-      EMQX_LISTENERS__QUIC__DEFAULT__SSL_OPTIONS__KEYFILE: /certs/server.key
+    command: sh -c "tc qdisc replace dev pub0 root ${QDISC} && exec refbroker -out /results"
     healthcheck:
-      test: emqx ctl status
-      interval: 3s
+      test: ss -ltn | grep -q :8883
+      interval: 1s
       retries: 30
 
   subscriber:
-    <<: *client
-    networks: [sub]
+    <<: *node
+    networks:
+      subscriber: {interface_name: sub0}
+    depends_on:
+      mqtt-broker: {condition: service_healthy}
+    command: gen sub -transport ${TRANSPORT} -t ${TOPIC_PREFIX}/# -out /results
+    healthcheck:
+      test: test -f /results/sub.csv # gen sub creates it once the subscription holds
+      interval: 1s
+      retries: 30
 
   publisher:
-    <<: *client
-    networks: [pub]
+    <<: *node
+    networks:
+      publishers: {interface_name: pub0}
     cap_add: [NET_ADMIN]
     ulimits: {nofile: 1048576}
+    depends_on:
+      subscriber: {condition: service_healthy}
+      capture: {condition: service_started, required: false}
+    # The local route lets each publisher bind its own address in PUBLISHER_ADDRESSES without adding them one by one.
+    command: >-
+      sh -c "ip route add local ${PUBLISHER_ADDRESSES} dev pub0 &&
+      tc qdisc replace dev pub0 root ${QDISC} &&
+      exec gen pub -transport ${TRANSPORT} -c ${PUBLISHERS} -R ${CONNECT_RATE} -rate ${MESSAGE_RATE}
+      -s ${PAYLOAD_SIZE} -prefix ${TOPIC_PREFIX} -steady ${STEADY_SECONDS} -pad ${PADDING_SECONDS}
+      -bind ${FIRST_PUBLISHER_ADDRESS} -out /results"
+
+  # Optional: set COMPOSE_PROFILES=capture in .env. tcpdump runs in the broker's network namespace and keeps
+  # the first CAPTURE_PACKETS packets of the MQTT ports. sleep keeps the service up after tcpdump stops,
+  # because compose ends the run when any container exits.
+  capture:
+    <<: *node
+    profiles: [capture]
+    network_mode: service:mqtt-broker
+    init: true
+    command: >-
+      sh -c "tcpdump -i any -U -c ${CAPTURE_PACKETS} -w /results/broker.pcap
+      '(tcp port 8883 or udp port 14567) and not net 127.0.0.0/8';
+      exec sleep infinity"
 
 networks:
-  pub: {ipam: {config: [{subnet: 10.77.1.0/24}]}}
-  sub: {ipam: {config: [{subnet: 10.77.2.0/24}]}}
+  publishers:
+    ipam: {config: [{subnet: "${PUBLISHER_SUBNET}", ip_range: "${CONTAINER_ADDRESSES}"}]}
+  subscriber:
+    ipam: {config: [{subnet: 10.78.2.0/24}]}
