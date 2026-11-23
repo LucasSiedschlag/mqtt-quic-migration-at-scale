@@ -223,6 +223,10 @@ func (run *publisherRun) writeConnections() error {
 // writeSummary writes pub.txt: the settings of the run and the final counters, one key=value per line.
 func (run *publisherRun) writeSummary(cut bool) error {
 	settings := run.settings
+	firstAddress := "" // empty when the kernel chooses the source addresses
+	if settings.firstAddress != nil {
+		firstAddress = settings.firstAddress.String()
+	}
 	lines := []string{
 		fmt.Sprintf("transport=%s", settings.transport),
 		fmt.Sprintf("publishers=%d", settings.publishers),
@@ -232,7 +236,7 @@ func (run *publisherRun) writeSummary(cut bool) error {
 		fmt.Sprintf("topic_prefix=%s", settings.topicPrefix),
 		fmt.Sprintf("steady_seconds=%d", settings.steadySeconds),
 		fmt.Sprintf("padding_seconds=%d", settings.paddingSeconds),
-		fmt.Sprintf("first_address=%s", settings.firstAddress),
+		fmt.Sprintf("first_address=%s", firstAddress),
 		fmt.Sprintf("time_limit=%s", settings.timeLimit),
 		fmt.Sprintf("started_at=%s", run.startedAt.UTC().Format(time.RFC3339)),
 		fmt.Sprintf("seconds=%.1f", time.Since(run.startedAt).Seconds()),

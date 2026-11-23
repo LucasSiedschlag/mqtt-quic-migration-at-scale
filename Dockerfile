@@ -1,11 +1,20 @@
+# One image for the broker, the publishers and the subscriber.
+
+# Build stage: static binaries of the broker (refbroker) and the load generator (gen).
+FROM golang:1.27 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY refbroker refbroker
+COPY gen gen
+RUN CGO_ENABLED=0 go build -o /out/ ./refbroker ./gen
+
+# Runtime stage.
+#   iproute2  tc (netem) and ip (publisher addresses)
+#   tcpdump   packet capture in the broker's network namespace
+#   ethtool   turns UDP segmentation offload off when a capture must be fully decodable
 FROM ubuntu:24.04
-# shortcut: arm64 build for Apple silicon hosts, use the amd64 asset on x86
-ARG V=0.6.2
-ARG ARCH=arm64
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      curl ca-certificates libatomic1 libssl3t64 iproute2 \
- && rm -rf /var/lib/apt/lists/* \
- && mkdir /opt/emqtt-bench \
- && curl -fsSL https://github.com/emqx/emqtt-bench/releases/download/$V/emqtt-bench-$V-ubuntu24.04-$ARCH-quic.tar.gz \
-    | tar -xz -C /opt/emqtt-bench
-ENV PATH=/opt/emqtt-bench/bin:$PATH
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends iproute2 tcpdump ethtool \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/refbroker /out/gen /usr/local/bin/
