@@ -1,2 +1,4 @@
 certs/
 results/
+.venv/
+__pycache__/

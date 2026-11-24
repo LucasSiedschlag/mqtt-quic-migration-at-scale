@@ -65,3 +65,30 @@ func TestMoveNeedsBind(t *testing.T) {
 		t.Fatalf("-move with -bind: error %v, reconnect %v; want no error and reconnect", err, settings.reconnect)
 	}
 }
+
+func TestUnknownMoveModeIsRefused(t *testing.T) {
+	if _, err := parsePublisherSettings([]string{"-move-mode", "teleport"}); err == nil {
+		t.Fatal("-move-mode teleport was accepted")
+	}
+}
+
+func TestMoveDropNeedsBlockStart(t *testing.T) {
+	if _, err := parsePublisherSettings([]string{"-move", "10", "-bind", "10.88.0.5", "-move-drop"}); err == nil {
+		t.Fatal("-move-drop with -bind inside a block was accepted")
+	}
+	if _, err := parsePublisherSettings([]string{"-move", "10", "-bind", "10.88.64.0", "-move-drop"}); err != nil {
+		t.Fatalf("-move-drop with -bind at a block start: %v", err)
+	}
+}
+
+func TestOnlyQUICMigrates(t *testing.T) {
+	for _, test := range []struct {
+		transport, moveMode string
+		migrates            bool
+	}{{"quic", "migrate", true}, {"quic", "reconnect", false}, {"tls", "migrate", false}} {
+		settings := publisherSettings{transport: test.transport, moveMode: test.moveMode}
+		if settings.migrates() != test.migrates {
+			t.Errorf("%s with %s: migrates %v, want %v", test.transport, test.moveMode, settings.migrates(), test.migrates)
+		}
+	}
+}

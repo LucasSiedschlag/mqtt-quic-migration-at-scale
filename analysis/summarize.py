@@ -1,20 +1,7 @@
 #!/usr/bin/env python3
-"""Usage: ./summarize.py <results folder>...      for example: ./summarize.py results/*
+"""Usage: ./analysis/summarize.py <results folder>...      for example: ./analysis/summarize.py results/*
 
-Prints one csv row for each run, with the numbers that the paper reports. It reads only the files of a run:
-pub.txt and pub.csv (gen pub), sub.csv (gen sub), broker-messages-dropped, broker-cpu.stat,
-broker-snmp and broker-dev (broker).
-
-A run is valid when:
-  - all messages of the steady phase arrived,
-  - no more messages arrived than were offered (more messages are duplicates),
-  - all publishers connected,
-  - the time limit did not stop the run,
-  - the broker dropped no message (a full outbound queue drops messages).
-In an address change run (move_at not empty), the delivery is a result and not a condition:
-TLS loses or repeats messages when it reconnects. Such a run is valid when all publishers connected,
-the time limit did not stop the run, the broker dropped no message, and move.csv and reconnect.csv exist.
-The script also summarizes failed runs, because saturated runs are part of the results.
+Prints one csv row for each run. README.md has the columns and the validity rule.
 """
 
 import csv
@@ -28,6 +15,9 @@ COLUMNS = [
     "message_rate",
     "payload_size",
     "move_at",
+    "move_mode",
+    "zero_rtt",
+    "move_drop",
     "received",
     "expected",
     "offered",
@@ -49,7 +39,7 @@ COLUMNS = [
 
 
 def percentile(sorted_values, percent):
-    """Nearest-rank percentile of a sorted list. None for an empty list."""
+    """Nearest-rank percentile of a sorted list; None for an empty list."""
     if not sorted_values:
         return None
     rank = min(len(sorted_values) - 1, int(percent / 100 * len(sorted_values)))
@@ -57,25 +47,21 @@ def percentile(sorted_values, percent):
 
 
 def read_settings(folder):
-    """pub.txt: the settings and the final counters of gen pub, one name=value on each line."""
     with open(os.path.join(folder, "pub.txt")) as file:
         return dict(line.rstrip("\n").split("=", 1) for line in file if "=" in line)
 
 
 def read_column(path, column):
-    """The integer values of one csv column, sorted."""
     with open(path) as file:
         return sorted(int(row[column]) for row in csv.DictReader(file))
 
 
 def broker_messages_dropped(folder):
-    """Messages the broker dropped because the outbound queue of a client was full."""
     with open(os.path.join(folder, "broker-messages-dropped")) as file:
         return int(file.read())
 
 
 def broker_cpu_seconds(folder):
-    """CPU time of the broker container during the run (cgroup cpu.stat, usage_usec)."""
     with open(os.path.join(folder, "broker-cpu.stat")) as file:
         for line in file:
             name, value = line.split()
@@ -85,7 +71,6 @@ def broker_cpu_seconds(folder):
 
 
 def broker_udp_errors(folder):
-    """UDP datagrams that the kernel of the broker dropped on receive (/proc/net/snmp, Udp InErrors)."""
     with open(os.path.join(folder, "broker-snmp")) as file:
         udp_lines = [line.split()[1:] for line in file if line.startswith("Udp:")]
     names, values = udp_lines  # first line: counter names; second line: counter values
@@ -93,8 +78,6 @@ def broker_udp_errors(folder):
 
 
 def publisher_link_bytes(folder):
-    """Bytes received plus bytes sent on pub0, the publisher interface of the broker (/proc/net/dev).
-    The counters start with the container. Thus, they include the packets before the first publisher."""
     with open(os.path.join(folder, "broker-dev")) as file:
         for line in file:
             interface, _, counters = line.partition(":")
@@ -147,6 +130,9 @@ def summarize(folder):
         "message_rate": message_rate,
         "payload_size": settings["payload_size"],
         "move_at": move_at,
+        "move_mode": settings.get("move_mode", ""),
+        "zero_rtt": settings.get("zero_rtt", ""),
+        "move_drop": settings.get("move_drop", ""),
         "received": received,
         "expected": expected,
         "offered": offered,

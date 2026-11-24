@@ -1,14 +1,15 @@
 package main
 
-// The address change test. During the steady phase, each publisher moves to a new source address,
-// as a device that changes network. QUIC migrates the open connection (RFC 9000, section 9).
-// TCP cannot change its address, so the client reconnects from the new address.
+// The address change test (see DETAILS.md).
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -18,10 +19,12 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-// At move k, publisher i moves to firstAddress + i + k*addressesPerMove.
-const addressesPerMove = 16384
+const (
+	addressesPerMove   = 16384 // at move k, publisher i uses firstAddress + i + k*16384: one /18 for each move
+	addressBlockPrefix = 18
+	publisherInterface = "pub0" // name given by compose.yaml
+)
 
-// parseMoveTimes reads the -move flag: seconds after publishing starts, separated by commas.
 func parseMoveTimes(list string) ([]time.Duration, error) {
 	var moveTimes []time.Duration
 	for _, field := range strings.Split(list, ",") {
@@ -37,7 +40,6 @@ func parseMoveTimes(list string) ([]time.Duration, error) {
 	return moveTimes, nil
 }
 
-// formatMoveTimes writes move times as -move reads them, for example "10,20".
 func formatMoveTimes(moveTimes []time.Duration) string {
 	seconds := make([]string, len(moveTimes))
 	for i, moveTime := range moveTimes {
@@ -46,23 +48,25 @@ func formatMoveTimes(moveTimes []time.Duration) string {
 	return strings.Join(seconds, ",")
 }
 
-// move gives the connection of the dialer a new source address.
-// TLS: move breaks the TCP connection. Paho then reconnects from the new address.
-// QUIC: move migrates the open connection: a new UDP socket, a path validation
-// (PATH_CHALLENGE and PATH_RESPONSE), then the switch to the new path.
-func (dialer *brokerDialer) move(newAddress net.IP) error {
+// move breaks the connection, so Paho reconnects from the new address, or with migrate it migrates the QUIC connection.
+func (dialer *brokerDialer) move(newAddress net.IP, migrate bool) error {
 	dialer.lock.Lock()
 	dialer.sourceAddress = newAddress
-	tcpConnection, quicConnection := dialer.tcpConnection, dialer.quicConnection
+	tcpConnection, quicConnection, quicStream := dialer.tcpConnection, dialer.quicConnection, dialer.quicStream
 	dialer.lock.Unlock()
 
+	// A deadline in the past, not Close: Paho ignores the error of a closed connection.
 	if dialer.transport == "tls" {
 		if tcpConnection == nil {
 			return errors.New("no connection to move")
 		}
-		// A deadline in the past makes each read and write fail. Close does not work here:
-		// Paho ignores the "use of closed network connection" error, because it expects it after its own Close.
 		return tcpConnection.SetDeadline(time.Unix(1, 0))
+	}
+	if !migrate {
+		if quicStream == nil {
+			return errors.New("no connection to move")
+		}
+		return quicStream.SetDeadline(time.Unix(1, 0))
 	}
 
 	if quicConnection == nil {
@@ -85,7 +89,7 @@ func (dialer *brokerDialer) move(newAddress net.IP) error {
 	if err := path.Switch(); err != nil {
 		return err
 	}
-	// Close the path of the previous move. This retires its connection ID, so the broker can issue a new one.
+	// Closing the previous path retires its connection ID.
 	if dialer.movedPath != nil {
 		dialer.movedPath.Close()
 	}
@@ -93,8 +97,50 @@ func (dialer *brokerDialer) move(newAddress net.IP) error {
 	return nil
 }
 
-// reconnectOptions makes Paho reconnect after a lost connection (default backoff).
-// lostAt holds the time of a loss (Unix ms) until the reconnection; 0 means connected.
+func (run *publisherRun) releaseMoves(publishStart time.Time) {
+	for number, after := range run.settings.moveTimes {
+		time.Sleep(time.Until(publishStart.Add(after)))
+		if run.settings.moveDrop {
+			previousBlock := addressOf(run.settings.firstAddress, number*addressesPerMove)
+			if err := dropAddresses(previousBlock, number == 0); err != nil {
+				fmt.Fprintf(os.Stderr, "move %d: %v\n", number+1, err)
+			}
+		}
+		close(run.moveSignals[number])
+	}
+}
+
+// dropAddresses uses tc, which drops after the socket without an error for the sender. An nftables drop
+// returns EPERM, and quic-go closes the connection after a send error (see DETAILS.md).
+func dropAddresses(block net.IP, firstBlock bool) error {
+	prefix := fmt.Sprintf("%s/%d", block, addressBlockPrefix)
+	commands := [][]string{
+		{"filter", "add", "dev", publisherInterface, "egress", "protocol", "ip", "u32", "match", "ip", "src", prefix, "action", "drop"},
+		{"filter", "add", "dev", publisherInterface, "ingress", "protocol", "ip", "u32", "match", "ip", "dst", prefix, "action", "drop"},
+	}
+	if firstBlock {
+		commands = append([][]string{{"qdisc", "add", "dev", publisherInterface, "clsact"}}, commands...)
+	}
+	for _, command := range commands {
+		if output, err := exec.Command("tc", command...).CombinedOutput(); err != nil {
+			return fmt.Errorf("drop %s: tc %s: %v: %s", prefix, strings.Join(command, " "), err, output)
+		}
+	}
+	fmt.Fprintf(os.Stderr, "dropped %s\n", prefix)
+	return nil
+}
+
+func isBlockStart(address net.IP) bool {
+	return binary.BigEndian.Uint32(address.To4())%addressesPerMove == 0
+}
+
+func (run *publisherRun) waitAndMove(dialer *brokerDialer, clientID string, index, move int) {
+	<-run.moveSignals[move-1]
+	startedAt := time.Now()
+	err := dialer.move(addressOf(run.settings.firstAddress, index+move*addressesPerMove), run.settings.migrates())
+	run.recordMove(clientID, move, startedAt, err)
+}
+
 func (run *publisherRun) reconnectOptions(clientID string, lostAt *atomic.Int64) func(*mqtt.ClientOptions) {
 	return func(options *mqtt.ClientOptions) {
 		options.SetAutoReconnect(true)
@@ -109,21 +155,11 @@ func (run *publisherRun) reconnectOptions(clientID string, lostAt *atomic.Int64)
 	}
 }
 
-// moveAt waits until the time of move number move, then moves the publisher and records the result.
-func (run *publisherRun) moveAt(dialer *brokerDialer, clientID string, index, move int, at time.Time) {
-	time.Sleep(time.Until(at))
-	startedAt := time.Now()
-	err := dialer.move(addressOf(run.settings.firstAddress, index+move*addressesPerMove))
-	run.recordMove(clientID, move, startedAt, err)
-}
-
-// recordMove adds a row to move.csv. DoneMs is the end of a QUIC migration. It stays empty
-// for TLS, because the TLS reconnection is in reconnect.csv.
 func (run *publisherRun) recordMove(clientID string, move int, startedAt time.Time, err error) {
-	doneMs, errorText := "", ""
+	doneMs, errorText := "", "" // DoneMs only for a QUIC migration; reconnect.csv has the times of a reconnection
 	if err != nil {
 		errorText = strings.ReplaceAll(err.Error(), ",", ";")
-	} else if run.settings.transport == "quic" {
+	} else if run.settings.migrates() {
 		doneMs = strconv.FormatInt(time.Now().UnixMilli(), 10)
 	}
 	run.rowsLock.Lock()
@@ -132,14 +168,12 @@ func (run *publisherRun) recordMove(clientID string, move int, startedAt time.Ti
 		fmt.Sprintf("%s,%d,%d,%s,%s\n", clientID, move, startedAt.UnixMilli(), doneMs, errorText))
 }
 
-// recordReconnection adds a row to reconnect.csv. reconnectedMs is 0 when the publisher did not reconnect.
 func (run *publisherRun) recordReconnection(clientID string, lostMs, reconnectedMs int64) {
 	run.rowsLock.Lock()
 	defer run.rowsLock.Unlock()
 	run.reconnectRows = append(run.reconnectRows, fmt.Sprintf("%s,%d,%d\n", clientID, lostMs, reconnectedMs))
 }
 
-// writeAddressChangeFiles writes move.csv and reconnect.csv, when the run uses them.
 func (run *publisherRun) writeAddressChangeFiles() error {
 	run.rowsLock.Lock()
 	defer run.rowsLock.Unlock()

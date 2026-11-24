@@ -5,8 +5,7 @@ import (
 	"time"
 )
 
-// The payload contains its send time. The subscriber uses it to calculate the delivery latency.
-// Layout: 8 bytes of send time (Unix milliseconds, big endian), then zeros to the payload size.
+// The payload starts with its send time (Unix ms, 8 bytes, big endian): the subscriber calculates the latency.
 const timestampSize = 8
 
 func newPayload(size int, sentAt time.Time) []byte {
@@ -15,7 +14,6 @@ func newPayload(size int, sentAt time.Time) []byte {
 	return payload
 }
 
-// sentAtMillis returns the send time that newPayload wrote, in Unix milliseconds.
 func sentAtMillis(payload []byte) (int64, bool) {
 	if len(payload) < timestampSize {
 		return 0, false

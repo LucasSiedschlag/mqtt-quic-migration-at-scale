@@ -16,25 +16,31 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
-const pubackTimeout = 10 * time.Second // a message without a PUBACK after this time is a failure
+const pubackTimeout = 10 * time.Second
 
 type publisherSettings struct {
 	brokerHost     string
-	transport      string // "tls" or "quic"
+	transport      string
 	publishers     int
-	connectRate    int // connection attempts per second, for all publishers together
-	messageRate    int // messages per second, for each publisher
+	connectRate    int // all publishers together
+	messageRate    int // for each publisher
 	payloadSize    int // bytes
 	topicPrefix    string
-	steadySeconds  int    // seconds of messages that must arrive
-	paddingSeconds int    // extra seconds of messages, which can be lost when the publishers stop
-	firstAddress   net.IP // source address of publisher 0; publisher i uses firstAddress + i; nil = the kernel selects
+	steadySeconds  int
+	paddingSeconds int    // messages that may be lost when the publishers stop
+	firstAddress   net.IP // publisher i binds firstAddress + i; nil = the kernel selects
 	timeLimit      time.Duration
 	outputDir      string
 
-	// address change test (address_change.go)
-	reconnect bool            // Paho reconnects after a lost connection
-	moveTimes []time.Duration // after publishing starts, each publisher moves to a new source address
+	reconnect bool
+	moveTimes []time.Duration
+	moveMode  string // QUIC: "migrate" or "reconnect"; TLS always reconnects
+	zeroRTT   bool
+	moveDrop  bool
+}
+
+func (settings publisherSettings) migrates() bool {
+	return settings.transport == "quic" && settings.moveMode == "migrate"
 }
 
 func parsePublisherSettings(args []string) (publisherSettings, error) {
@@ -56,10 +62,18 @@ func parsePublisherSettings(args []string) (publisherSettings, error) {
 	flags.BoolVar(&settings.reconnect, "reconnect", false, "reconnect after a lost connection; writes reconnect.csv")
 	flags.StringVar(&moveTimes, "move", "", "seconds after publishing starts, separated by commas, at which each publisher "+
 		"moves to a new source address; needs -bind, sets -reconnect, writes move.csv")
+	flags.StringVar(&settings.moveMode, "move-mode", "migrate", "QUIC at a move: migrate (same connection, new path) "+
+		"or reconnect (new connection); TLS always reconnects")
+	flags.BoolVar(&settings.zeroRTT, "0rtt", false, "QUIC: a reconnection sends the MQTT CONNECT as early data (0-RTT)")
+	flags.BoolVar(&settings.moveDrop, "move-drop", false, "at each move, first drop the previous addresses with tc filters on "+
+		publisherInterface+" (needs NET_ADMIN)")
 	flags.Parse(args)
 
 	if settings.connectRate < 1 || settings.messageRate < 1 {
 		return settings, errors.New("-R and -rate must be at least 1")
+	}
+	if settings.moveMode != "migrate" && settings.moveMode != "reconnect" {
+		return settings, fmt.Errorf("-move-mode %q: use migrate or reconnect", settings.moveMode)
 	}
 	if firstAddress != "" {
 		settings.firstAddress = net.ParseIP(firstAddress).To4()
@@ -79,19 +93,20 @@ func parsePublisherSettings(args []string) (publisherSettings, error) {
 		if settings.publishers > addressesPerMove {
 			return settings, fmt.Errorf("-move allows at most %d publishers", addressesPerMove)
 		}
-		settings.reconnect = true // a TLS client must reconnect from its new address
+		if settings.moveDrop && !isBlockStart(settings.firstAddress) {
+			return settings, fmt.Errorf("-move-drop needs -bind at the start of a /%d block", addressBlockPrefix)
+		}
+		settings.reconnect = true // after a move, TLS must reconnect
 	}
 	return settings, nil
 }
 
-// addressOf returns the source address of publisher index: first + index.
 func addressOf(first net.IP, index int) net.IP {
 	address := make(net.IP, 4)
 	binary.BigEndian.PutUint32(address, binary.BigEndian.Uint32(first.To4())+uint32(index))
 	return address
 }
 
-// publisherRun contains the data that all publishers of one run share.
 type publisherRun struct {
 	settings  publisherSettings
 	startedAt time.Time
@@ -102,26 +117,29 @@ type publisherRun struct {
 	publishFailed atomic.Int64
 
 	rowsLock       sync.Mutex
-	connectionRows []string // one row of pub.csv for each connected publisher
-	moveRows       []string // one row of move.csv for each move of each publisher
-	reconnectRows  []string // one row of reconnect.csv for each lost connection
+	connectionRows []string
+	moveRows       []string
+	reconnectRows  []string
 
-	startPublishing chan struct{}  // closed when all connection attempts have started
-	connectionPhase sync.WaitGroup // done when each publisher is connected or failed
-	allPublishers   sync.WaitGroup // done when all publishers are finished
+	startPublishing chan struct{}   // closed when all connection attempts have started
+	moveSignals     []chan struct{} // closed at the time of each move
+	connectionPhase sync.WaitGroup  // done when each publisher is connected or failed
+	allPublishers   sync.WaitGroup
 }
 
-// runPublishers runs the publisher side of one run: first the connection storm, then the messages.
 func runPublishers(args []string) error {
 	settings, err := parsePublisherSettings(args)
 	if err != nil {
 		return err
 	}
 	run := &publisherRun{settings: settings, startedAt: time.Now(), startPublishing: make(chan struct{})}
+	for range settings.moveTimes {
+		run.moveSignals = append(run.moveSignals, make(chan struct{}))
+	}
 	time.AfterFunc(settings.timeLimit, run.cut)
+	run.printAddresses()
 	go run.printProgress()
 
-	// connection storm: one new publisher each 1/connectRate seconds
 	pacer := time.NewTicker(time.Second / time.Duration(settings.connectRate))
 	for index := range settings.publishers {
 		<-pacer.C
@@ -131,8 +149,9 @@ func runPublishers(args []string) error {
 	}
 	pacer.Stop()
 	close(run.startPublishing)
+	go run.releaseMoves(time.Now())
 
-	// write pub.csv when the connection phase ends, so that a run that stops later keeps it
+	// written now, so that a run cut later keeps it
 	run.connectionPhase.Wait()
 	if err := run.writeConnections(); err != nil {
 		return err
@@ -144,11 +163,10 @@ func runPublishers(args []string) error {
 	return run.writeSummary(false)
 }
 
-// publisher connects publisher number index. It waits until all connection attempts have started, then publishes.
 func (run *publisherRun) publisher(index int) {
 	defer run.allPublishers.Done()
 	clientID := fmt.Sprintf("gen_pub_%d", index)
-	var lostAt atomic.Int64 // time of a lost connection (Unix ms) until the reconnection; 0 = connected
+	var lostAt atomic.Int64 // Unix ms of a lost connection until the reconnection; 0 = connected
 	client, dialer, err := run.connect(index, clientID, &lostAt)
 	if err != nil {
 		run.connectFailed.Add(1)
@@ -161,8 +179,8 @@ func (run *publisherRun) publisher(index int) {
 	<-run.startPublishing
 	publishStart := time.Now()
 	var moves sync.WaitGroup
-	for number, after := range run.settings.moveTimes {
-		moves.Go(func() { run.moveAt(dialer, clientID, index, number+1, publishStart.Add(after)) })
+	for number := range run.settings.moveTimes {
+		moves.Go(func() { run.waitAndMove(dialer, clientID, index, number+1) })
 	}
 	run.sendMessages(client, fmt.Sprintf("%s/%d", run.settings.topicPrefix, index), publishStart)
 	moves.Wait()
@@ -181,7 +199,8 @@ func (run *publisherRun) connect(index int, clientID string, lostAt *atomic.Int6
 	if err != nil {
 		return nil, nil, err
 	}
-	dialer.movable = len(run.settings.moveTimes) > 0
+	dialer.movable = len(run.settings.moveTimes) > 0 && run.settings.migrates()
+	dialer.zeroRTT = run.settings.zeroRTT
 	var configure []func(*mqtt.ClientOptions)
 	if run.settings.reconnect {
 		configure = append(configure, run.reconnectOptions(clientID, lostAt))
@@ -200,9 +219,7 @@ func (run *publisherRun) connect(index int, clientID string, lostAt *atomic.Int6
 	return client, dialer, nil
 }
 
-// sendMessages sends message m at start + m/messageRate. It does not wait for the PUBACK of the
-// previous message (QoS 1 messages in flight). Thus, the offered rate does not change with the round
-// trip time. A late publisher sends its next message immediately. A second goroutine counts the PUBACKs.
+// sendMessages does not wait for the PUBACK of the previous message, so the offered rate does not depend on the RTT.
 func (run *publisherRun) sendMessages(client mqtt.Client, topic string, start time.Time) {
 	total := (run.settings.steadySeconds + run.settings.paddingSeconds) * run.settings.messageRate
 	interval := time.Second / time.Duration(run.settings.messageRate)
@@ -228,7 +245,6 @@ func (run *publisherRun) sendMessages(client mqtt.Client, topic string, start ti
 	<-allCounted
 }
 
-// cut stops a run that is longer than the time limit. This occurs when the broker cannot process the load.
 func (run *publisherRun) cut() {
 	if err := run.writeAddressChangeFiles(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -238,6 +254,18 @@ func (run *publisherRun) cut() {
 	}
 	fmt.Fprintf(os.Stderr, "cut after %s\n", run.settings.timeLimit)
 	os.Exit(1)
+}
+
+func (run *publisherRun) printAddresses() {
+	first, last := run.settings.firstAddress, run.settings.publishers-1
+	if first == nil {
+		fmt.Println("publisher addresses: chosen by the kernel")
+		return
+	}
+	fmt.Printf("publishers 0 to %d: %s to %s\n", last, first, addressOf(first, last))
+	for move := 1; move <= len(run.settings.moveTimes); move++ {
+		fmt.Printf("move %d: %s to %s\n", move, addressOf(first, move*addressesPerMove), addressOf(first, last+move*addressesPerMove))
+	}
 }
 
 func (run *publisherRun) printProgress() {
@@ -254,8 +282,6 @@ func (run *publisherRun) recordConnection(clientID string, handshake, connect ti
 		fmt.Sprintf("%s,%d,%d,%d\n", clientID, time.Now().UnixMilli(), handshake.Milliseconds(), connect.Milliseconds()))
 }
 
-// writeConnections writes pub.csv: one row for each connected publisher, times in ms.
-// Handshake is the TLS or QUIC handshake. Connect is the time from the start of the connection to the MQTT CONNACK.
 func (run *publisherRun) writeConnections() error {
 	run.rowsLock.Lock()
 	defer run.rowsLock.Unlock()
@@ -267,10 +293,9 @@ func (run *publisherRun) writeOutput(fileName, content string) error {
 	return os.WriteFile(filepath.Join(run.settings.outputDir, fileName), []byte(content), 0o644)
 }
 
-// writeSummary writes pub.txt: the settings of the run and the final counters, one name=value on each line.
 func (run *publisherRun) writeSummary(cut bool) error {
 	settings := run.settings
-	firstAddress := "" // empty when the kernel selects the source addresses
+	firstAddress := ""
 	if settings.firstAddress != nil {
 		firstAddress = settings.firstAddress.String()
 	}
@@ -287,7 +312,11 @@ func (run *publisherRun) writeSummary(cut bool) error {
 		fmt.Sprintf("time_limit=%s", settings.timeLimit),
 		fmt.Sprintf("reconnect=%t", settings.reconnect),
 		fmt.Sprintf("move_at=%s", formatMoveTimes(settings.moveTimes)),
-		fmt.Sprintf("started_at=%s", run.startedAt.UTC().Format(time.RFC3339)),
+		fmt.Sprintf("move_mode=%s", settings.moveMode),
+		fmt.Sprintf("zero_rtt=%t", settings.zeroRTT),
+		fmt.Sprintf("move_drop=%t", settings.moveDrop),
+		fmt.Sprintf("started_at=%s", run.startedAt.Format(time.RFC3339)), // local time
+		fmt.Sprintf("started_at_ms=%d", run.startedAt.UnixMilli()),       // same unit as the csv times
 		fmt.Sprintf("seconds=%.1f", time.Since(run.startedAt).Seconds()),
 		fmt.Sprintf("connected=%d", run.connected.Load()),
 		fmt.Sprintf("connect_failed=%d", run.connectFailed.Load()),

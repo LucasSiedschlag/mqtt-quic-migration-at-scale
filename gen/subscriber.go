@@ -15,11 +15,9 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
-// quietSecondsBeforeExit: after SIGTERM, the subscriber continues to receive until no message arrives
-// for this number of seconds. The broker can still deliver messages after the publishers stop.
+// After SIGTERM, the broker can still be delivering: wait until no message arrives for this time.
 const quietSecondsBeforeExit = 2
 
-// runSubscriber subscribes to all publisher topics and writes the latency of each message to sub.csv.
 func runSubscriber(args []string) error {
 	flags := flag.NewFlagSet("sub", flag.ExitOnError)
 	brokerHost := flags.String("h", "mqtt-broker", "broker host")
@@ -46,13 +44,12 @@ func runSubscriber(args []string) error {
 	if err := latencies.markSubscribed(); err != nil {
 		return err
 	}
+	fmt.Printf("subscribed to %s from %s\n", *topic, dialer.localIP())
 	waitForStopAndQuiet(latencies)
 	return latencies.close()
 }
 
-// latencyFile is sub.csv: one row for each received message, with the receive time and the latency in ms.
-// The file has a temporary name until the subscription is active. Then it gets its final name,
-// which the compose healthcheck waits for.
+// latencyFile is sub.csv, named sub.csv.part until the subscription holds: the compose healthcheck waits for sub.csv.
 type latencyFile struct {
 	path     string
 	file     *os.File
@@ -68,11 +65,10 @@ func createLatencyFile(path string) (*latencyFile, error) {
 		return nil, err
 	}
 	latencies := &latencyFile{path: path, file: file, writer: bufio.NewWriter(file)}
-	latencies.writer.WriteString("ReceivedAt,Latency\n")
+	latencies.writer.WriteString("Topic,ReceivedAt,Latency\n")
 	return latencies, nil
 }
 
-// record is the Paho message handler.
 func (latencies *latencyFile) record(_ mqtt.Client, message mqtt.Message) {
 	latencies.received.Add(1)
 	receivedAt := time.Now().UnixMilli()
@@ -82,7 +78,7 @@ func (latencies *latencyFile) record(_ mqtt.Client, message mqtt.Message) {
 	}
 	latencies.lock.Lock()
 	defer latencies.lock.Unlock()
-	fmt.Fprintf(latencies.writer, "%d,%d\n", receivedAt, receivedAt-sentAt)
+	fmt.Fprintf(latencies.writer, "%s,%d,%d\n", message.Topic(), receivedAt, receivedAt-sentAt)
 }
 
 func (latencies *latencyFile) markSubscribed() error {
@@ -100,8 +96,6 @@ func (latencies *latencyFile) close() error {
 	return latencies.file.Close()
 }
 
-// waitForStopAndQuiet writes the file to disk each second. It returns after a stop request (SIGTERM or Ctrl-C)
-// and quietSecondsBeforeExit seconds without a message.
 func waitForStopAndQuiet(latencies *latencyFile) {
 	stopSignal := make(chan os.Signal, 1)
 	signal.Notify(stopSignal, syscall.SIGTERM, os.Interrupt)
