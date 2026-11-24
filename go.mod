@@ -5,7 +5,7 @@ go 1.27.3
 require (
 	github.com/eclipse/paho.mqtt.golang v1.5.1
 	github.com/mochi-mqtt/server/v2 v2.7.9
-	github.com/quic-go/quic-go v0.63.0
+	github.com/quic-go/quic-go v0.66.0
 )
 
 require (
