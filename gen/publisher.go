@@ -16,19 +16,19 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
-const pubackTimeout = 10 * time.Second // a message without PUBACK after this time counts as failed
+const pubackTimeout = 10 * time.Second // a message without a PUBACK after this time is a failure
 
 type publisherSettings struct {
 	brokerHost     string
 	transport      string // "tls" or "quic"
 	publishers     int
-	connectRate    int // connection attempts per second, all publishers together
-	messageRate    int // messages per second, per publisher
+	connectRate    int // connection attempts per second, for all publishers together
+	messageRate    int // messages per second, for each publisher
 	payloadSize    int // bytes
 	topicPrefix    string
 	steadySeconds  int    // seconds of messages that must arrive
-	paddingSeconds int    // extra seconds of messages; they may be lost when the publishers exit
-	firstAddress   net.IP // source address of publisher 0; publisher i uses firstAddress + i. nil = chosen by the kernel
+	paddingSeconds int    // extra seconds of messages, which can be lost when the publishers stop
+	firstAddress   net.IP // source address of publisher 0; publisher i uses firstAddress + i; nil = the kernel selects
 	timeLimit      time.Duration
 	outputDir      string
 }
@@ -40,14 +40,14 @@ func parsePublisherSettings(args []string) (publisherSettings, error) {
 	flags.StringVar(&settings.brokerHost, "h", "mqtt-broker", "broker host")
 	flags.StringVar(&settings.transport, "transport", "quic", "tls or quic")
 	flags.IntVar(&settings.publishers, "c", 1, "number of publishers")
-	flags.IntVar(&settings.connectRate, "R", 400, "connection attempts per second, all publishers together")
-	flags.IntVar(&settings.messageRate, "rate", 1, "messages per second, per publisher")
+	flags.IntVar(&settings.connectRate, "R", 400, "connection attempts per second, for all publishers together")
+	flags.IntVar(&settings.messageRate, "rate", 1, "messages per second, for each publisher")
 	flags.IntVar(&settings.payloadSize, "s", 256, "payload size in bytes")
 	flags.StringVar(&settings.topicPrefix, "prefix", "bench", "publisher i publishes on <prefix>/<i>")
 	flags.IntVar(&settings.steadySeconds, "steady", 30, "seconds of messages that must arrive")
-	flags.IntVar(&settings.paddingSeconds, "pad", 3, "extra seconds of messages, may be lost when the publishers exit")
-	flags.StringVar(&firstAddress, "bind", "", "source address of publisher 0; publisher i uses this address + i (empty = chosen by the kernel)")
-	flags.DurationVar(&settings.timeLimit, "limit", 120*time.Second, "the run is cut after this time and exits with status 1")
+	flags.IntVar(&settings.paddingSeconds, "pad", 3, "extra seconds of messages, which can be lost when the publishers stop")
+	flags.StringVar(&firstAddress, "bind", "", "source address of publisher 0; publisher i uses this address + i (empty = the kernel selects)")
+	flags.DurationVar(&settings.timeLimit, "limit", 120*time.Second, "the run stops after this time and exits with status 1")
 	flags.StringVar(&settings.outputDir, "out", ".", "directory for pub.csv and pub.txt")
 	flags.Parse(args)
 
@@ -70,7 +70,7 @@ func addressOf(first net.IP, index int) net.IP {
 	return address
 }
 
-// publisherRun is what the publishers of one run share.
+// publisherRun contains the data that all publishers of one run share.
 type publisherRun struct {
 	settings  publisherSettings
 	startedAt time.Time
@@ -81,14 +81,14 @@ type publisherRun struct {
 	publishFailed atomic.Int64
 
 	connectionRowsLock sync.Mutex
-	connectionRows     []string // one row of pub.csv per connected publisher
+	connectionRows     []string // one row of pub.csv for each connected publisher
 
-	startPublishing chan struct{}  // closed once every connection attempt has started
-	connectionPhase sync.WaitGroup // done when every publisher has connected or failed
-	allPublishers   sync.WaitGroup // done when every publisher has finished
+	startPublishing chan struct{}  // closed when all connection attempts have started
+	connectionPhase sync.WaitGroup // done when each publisher is connected or failed
+	allPublishers   sync.WaitGroup // done when all publishers are finished
 }
 
-// runPublishers runs the whole publisher side of one run: the connection storm, then the messages.
+// runPublishers runs the publisher side of one run: first the connection storm, then the messages.
 func runPublishers(args []string) error {
 	settings, err := parsePublisherSettings(args)
 	if err != nil {
@@ -98,7 +98,7 @@ func runPublishers(args []string) error {
 	time.AfterFunc(settings.timeLimit, run.cut)
 	go run.printProgress()
 
-	// connection storm: a new publisher every 1/connectRate seconds
+	// connection storm: one new publisher each 1/connectRate seconds
 	pacer := time.NewTicker(time.Second / time.Duration(settings.connectRate))
 	for index := range settings.publishers {
 		<-pacer.C
@@ -109,7 +109,7 @@ func runPublishers(args []string) error {
 	pacer.Stop()
 	close(run.startPublishing)
 
-	// pub.csv is written as soon as the connection phase ends, so a run that is cut later keeps it
+	// write pub.csv when the connection phase ends, so that a run that stops later keeps it
 	run.connectionPhase.Wait()
 	if err := run.writeConnections(); err != nil {
 		return err
@@ -118,7 +118,7 @@ func runPublishers(args []string) error {
 	return run.writeSummary(false)
 }
 
-// publisher connects publisher number index, waits until every connection attempt has started, then publishes.
+// publisher connects publisher number index. It waits until all connection attempts have started, then publishes.
 func (run *publisherRun) publisher(index int) {
 	defer run.allPublishers.Done()
 	client, err := run.connect(index)
@@ -159,9 +159,9 @@ func (run *publisherRun) connect(index int) (mqtt.Client, error) {
 	return client, nil
 }
 
-// sendMessages sends message m at start + m/messageRate, without waiting for the PUBACK of the previous
-// message (QoS 1 messages in flight), so the offered rate does not depend on the round trip time.
-// A publisher that falls behind sends its next message at once. A second goroutine counts the PUBACKs.
+// sendMessages sends message m at start + m/messageRate. It does not wait for the PUBACK of the
+// previous message (QoS 1 messages in flight). Thus, the offered rate does not change with the round
+// trip time. A late publisher sends its next message immediately. A second goroutine counts the PUBACKs.
 func (run *publisherRun) sendMessages(client mqtt.Client, topic string) {
 	total := (run.settings.steadySeconds + run.settings.paddingSeconds) * run.settings.messageRate
 	interval := time.Second / time.Duration(run.settings.messageRate)
@@ -188,7 +188,7 @@ func (run *publisherRun) sendMessages(client mqtt.Client, topic string) {
 	<-allCounted
 }
 
-// cut ends a run that went past the time limit, a sign that the broker no longer keeps up.
+// cut stops a run that is longer than the time limit. This occurs when the broker cannot process the load.
 func (run *publisherRun) cut() {
 	if err := run.writeSummary(true); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -211,8 +211,8 @@ func (run *publisherRun) recordConnection(clientID string, handshake, connect ti
 		fmt.Sprintf("%s,%d,%d,%d\n", clientID, time.Now().UnixMilli(), handshake.Milliseconds(), connect.Milliseconds()))
 }
 
-// writeConnections writes pub.csv: one row per connected publisher, times in ms.
-// Handshake is the TLS or QUIC handshake, Connect is from the start of the connection to the MQTT CONNACK.
+// writeConnections writes pub.csv: one row for each connected publisher, times in ms.
+// Handshake is the TLS or QUIC handshake. Connect is the time from the start of the connection to the MQTT CONNACK.
 func (run *publisherRun) writeConnections() error {
 	run.connectionRowsLock.Lock()
 	defer run.connectionRowsLock.Unlock()
@@ -220,10 +220,10 @@ func (run *publisherRun) writeConnections() error {
 	return os.WriteFile(filepath.Join(run.settings.outputDir, "pub.csv"), []byte(content), 0o644)
 }
 
-// writeSummary writes pub.txt: the settings of the run and the final counters, one key=value per line.
+// writeSummary writes pub.txt: the settings of the run and the final counters, one name=value on each line.
 func (run *publisherRun) writeSummary(cut bool) error {
 	settings := run.settings
-	firstAddress := "" // empty when the kernel chooses the source addresses
+	firstAddress := "" // empty when the kernel selects the source addresses
 	if settings.firstAddress != nil {
 		firstAddress = settings.firstAddress.String()
 	}

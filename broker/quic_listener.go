@@ -15,8 +15,8 @@ import (
 
 const quicListenerID = "quic"
 
-// quicListener is a mochi-mqtt listener on quic-go. The first bidirectional stream a client opens
-// on its QUIC connection carries the MQTT connection.
+// quicListener is a mochi-mqtt listener on quic-go. On each QUIC connection, the first
+// bidirectional stream from the client carries the MQTT connection.
 type quicListener struct {
 	address   string
 	tlsConfig *tls.Config
@@ -31,7 +31,7 @@ func (listener *quicListener) ID() string       { return quicListenerID }
 func (listener *quicListener) Address() string  { return listener.address }
 func (listener *quicListener) Protocol() string { return "quic" }
 
-// Init opens the UDP socket and starts listening for QUIC connections.
+// Init opens the UDP socket and starts to listen for QUIC connections.
 func (listener *quicListener) Init(*slog.Logger) error {
 	listener.ctx, listener.cancel = context.WithCancel(context.Background())
 	udpAddress, err := net.ResolveUDPAddr("udp4", listener.address)
@@ -47,11 +47,11 @@ func (listener *quicListener) Init(*slog.Logger) error {
 	return err
 }
 
-// Serve accepts QUIC connections until the listener closes and hands each MQTT stream to mochi-mqtt.
+// Serve accepts QUIC connections until the listener closes. It gives each MQTT stream to mochi-mqtt.
 //
-// quic-go refuses (CONNECTION_REFUSED) connections that finished their handshake while its accept queue,
-// 32 entries, is full. One accept loop does not empty it fast enough during a connection storm,
-// so several loops run in parallel.
+// When its accept queue (32 entries) is full, quic-go refuses (CONNECTION_REFUSED) connections
+// with a completed handshake. During a connection storm, one accept loop cannot empty the queue
+// fast enough. Thus, several loops run in parallel.
 func (listener *quicListener) Serve(establish listeners.EstablishFn) {
 	var acceptLoops sync.WaitGroup
 	for range 4 * runtime.NumCPU() {
@@ -59,7 +59,7 @@ func (listener *quicListener) Serve(establish listeners.EstablishFn) {
 			for {
 				connection, err := listener.listener.Accept(listener.ctx)
 				if err != nil {
-					return // the listener was closed
+					return // the listener is closed
 				}
 				go listener.serveConnection(connection, establish)
 			}
@@ -68,7 +68,7 @@ func (listener *quicListener) Serve(establish listeners.EstablishFn) {
 	acceptLoops.Wait()
 }
 
-// serveConnection waits for the client's first stream and runs the MQTT session on it.
+// serveConnection waits for the first stream from the client and runs the MQTT session on it.
 func (listener *quicListener) serveConnection(connection *quic.Conn, establish listeners.EstablishFn) {
 	stream, err := connection.AcceptStream(listener.ctx)
 	if err != nil {
@@ -86,8 +86,8 @@ func (listener *quicListener) Close(closeClients listeners.CloseFn) {
 	})
 }
 
-// quicStreamConn presents a QUIC stream as the net.Conn mochi-mqtt expects.
-// Read, Write and the deadlines come from the stream; the addresses come from the connection.
+// quicStreamConn makes a QUIC stream look like the net.Conn that mochi-mqtt expects.
+// Read, Write and the deadlines come from the stream. The addresses come from the connection.
 type quicStreamConn struct {
 	*quic.Stream
 	connection *quic.Conn

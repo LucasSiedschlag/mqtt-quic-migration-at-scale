@@ -1,7 +1,7 @@
 package main
 
-// The two transports. The MQTT client (Eclipse Paho, MQTT 3.1.1) is the same for both;
-// only the function that opens the network connection changes.
+// The two transports. They use the same MQTT client (Eclipse Paho, MQTT 3.1.1).
+// Only the function that opens the network connection is different.
 
 import (
 	"context"
@@ -21,12 +21,12 @@ import (
 
 var brokerPorts = map[string]string{"tls": "8883", "quic": "14567"}
 
-// brokerDialer opens one connection to the broker, over TCP + TLS 1.3 or over QUIC,
-// and remembers how long the handshake took.
+// brokerDialer opens one connection to the broker, over TCP + TLS 1.3 or over QUIC.
+// It records the handshake time.
 type brokerDialer struct {
 	transport     string
 	brokerAddress string // host:port
-	sourceAddress net.IP // local address to bind; nil = chosen by the kernel
+	sourceAddress net.IP // local address to bind; nil = the kernel selects
 	tlsConfig     *tls.Config
 	handshake     atomic.Int64 // nanoseconds
 }
@@ -37,10 +37,10 @@ func newBrokerDialer(transport, brokerHost string, sourceAddress net.IP) (*broke
 		return nil, fmt.Errorf("unknown transport %q, use tls or quic", transport)
 	}
 	tlsConfig := &tls.Config{
-		InsecureSkipVerify: true, // certificate checks are not what the benchmark measures
+		InsecureSkipVerify: true, // the benchmark does not measure certificate checks
 		MinVersion:         tls.VersionTLS13,
 		MaxVersion:         tls.VersionTLS13,
-		KeyLogWriter:       tlsKeyLog(), // lets Wireshark decrypt a capture
+		KeyLogWriter:       tlsKeyLog(), // Wireshark uses this file to decrypt a capture
 	}
 	if transport == "quic" {
 		tlsConfig.NextProtos = []string{"mqtt"} // ALPN of MQTT over QUIC
@@ -53,7 +53,7 @@ func newBrokerDialer(transport, brokerHost string, sourceAddress net.IP) (*broke
 	}, nil
 }
 
-// tlsKeyLog is the file named by SSLKEYLOGFILE, opened once and shared by every connection, or nil.
+// tlsKeyLog is the file in SSLKEYLOGFILE, or nil. All connections share it.
 var tlsKeyLog = sync.OnceValue(func() io.Writer {
 	path := os.Getenv("SSLKEYLOGFILE")
 	if path == "" {
@@ -71,7 +71,7 @@ func (dialer *brokerDialer) handshakeTime() time.Duration {
 	return time.Duration(dialer.handshake.Load())
 }
 
-// open is called by Paho to get the connection it speaks MQTT over.
+// open gives Paho the network connection for MQTT.
 func (dialer *brokerDialer) open(*url.URL, mqtt.ClientOptions) (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
 	defer cancel()
@@ -103,7 +103,7 @@ func (dialer *brokerDialer) openQUIC(ctx context.Context) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	// shortcut: the UDP socket stays open after the connection closes (one per publisher, freed when the process exits)
+	// shortcut: the UDP socket stays open after the connection closes. There is one socket for each publisher; the process frees them when it exits.
 	udpSocket, err := net.ListenUDP("udp4", &net.UDPAddr{IP: dialer.sourceAddress})
 	if err != nil {
 		return nil, err
@@ -117,9 +117,9 @@ func (dialer *brokerDialer) openQUIC(ctx context.Context) (net.Conn, error) {
 		udpSocket.Close()
 		return nil, err
 	}
-	dialer.handshake.Store(int64(time.Since(start))) // quic.Dial returns once the handshake is complete
+	dialer.handshake.Store(int64(time.Since(start))) // quic.Dial returns when the handshake is complete
 
-	// the first bidirectional stream the client opens carries the MQTT connection
+	// the first bidirectional stream from the client carries the MQTT connection
 	stream, err := quicConnection.OpenStreamSync(ctx)
 	if err != nil {
 		quicConnection.CloseWithError(0, "")
@@ -128,8 +128,8 @@ func (dialer *brokerDialer) openQUIC(ctx context.Context) (net.Conn, error) {
 	return quicStreamConn{Stream: stream, connection: quicConnection}, nil
 }
 
-// quicStreamConn presents a QUIC stream as the net.Conn Paho expects.
-// Read, Write and the deadlines come from the stream; the addresses come from the connection.
+// quicStreamConn makes a QUIC stream look like the net.Conn that Paho expects.
+// Read, Write and the deadlines come from the stream. The addresses come from the connection.
 type quicStreamConn struct {
 	*quic.Stream
 	connection *quic.Conn
@@ -143,11 +143,11 @@ func (stream quicStreamConn) Close() error {
 	return stream.connection.CloseWithError(0, "")
 }
 
-// newMQTTClient returns a Paho client that connects through dialer. It never reconnects and never
-// retries a connection, so every failed connection counts.
+// newMQTTClient returns a Paho client that connects through dialer. The client does not reconnect
+// and does not retry a connection. Thus, each failed connection counts.
 func newMQTTClient(dialer *brokerDialer, clientID string, onMessage mqtt.MessageHandler) mqtt.Client {
 	options := mqtt.NewClientOptions().
-		AddBroker("tcp://" + dialer.brokerAddress). // only a label: the connection comes from dialer.open
+		AddBroker("tcp://" + dialer.brokerAddress). // only a label: dialer.open makes the connection
 		SetClientID(clientID).
 		SetProtocolVersion(4). // MQTT 3.1.1
 		SetCleanSession(true).

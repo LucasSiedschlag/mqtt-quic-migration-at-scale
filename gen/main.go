@@ -1,9 +1,9 @@
 // gen is the MQTT load generator of the benchmark.
 //
-//	gen pub [flags]   opens one MQTT connection per publisher and publishes on each of them
-//	gen sub [flags]   subscribes to every publisher topic and records the latency of each message
+//	gen pub [flags]   opens one MQTT connection for each publisher and publishes on it
+//	gen sub [flags]   subscribes to all publisher topics and records the latency of each message
 //
-// Run "gen pub -help" or "gen sub -help" for the flags.
+// "gen pub -help" and "gen sub -help" show the flags.
 package main
 
 import (
@@ -13,9 +13,9 @@ import (
 )
 
 const (
-	connectTimeout     = 30 * time.Second // for the TLS or QUIC handshake and for the MQTT CONNECT
-	qosAtLeastOnce     = 1                // QoS 1: the broker acknowledges each message with a PUBACK
-	disconnectWaitMsec = 250              // time Paho waits for pending work before it disconnects
+	connectTimeout     = 30 * time.Second // limit for the TLS or QUIC handshake and for the MQTT CONNECT
+	qosAtLeastOnce     = 1                // QoS 1: the broker sends a PUBACK for each message
+	disconnectWaitMsec = 250              // Paho waits this time for pending work, then disconnects
 )
 
 func main() {

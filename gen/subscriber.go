@@ -15,11 +15,11 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
-// quietSecondsBeforeExit: after SIGTERM the subscriber keeps receiving until this many seconds pass
-// without a new message, because the broker may still be delivering when the publishers have finished.
+// quietSecondsBeforeExit: after SIGTERM, the subscriber continues to receive until no message arrives
+// for this number of seconds. The broker can still deliver messages after the publishers stop.
 const quietSecondsBeforeExit = 2
 
-// runSubscriber subscribes to every publisher topic and writes the latency of each message to sub.csv.
+// runSubscriber subscribes to all publisher topics and writes the latency of each message to sub.csv.
 func runSubscriber(args []string) error {
 	flags := flag.NewFlagSet("sub", flag.ExitOnError)
 	brokerHost := flags.String("h", "mqtt-broker", "broker host")
@@ -50,9 +50,9 @@ func runSubscriber(args []string) error {
 	return latencies.close()
 }
 
-// latencyFile is sub.csv: one row per received message, with the receive time and the latency in ms.
-// It is written under a temporary name and gets its final name once the subscription holds,
-// so the compose healthcheck can wait for the file.
+// latencyFile is sub.csv: one row for each received message, with the receive time and the latency in ms.
+// The file has a temporary name until the subscription is active. Then it gets its final name,
+// which the compose healthcheck waits for.
 type latencyFile struct {
 	path     string
 	file     *os.File
@@ -62,7 +62,7 @@ type latencyFile struct {
 }
 
 func createLatencyFile(path string) (*latencyFile, error) {
-	os.Remove(path) // left by an earlier run
+	os.Remove(path) // from an earlier run
 	file, err := os.Create(path + ".part")
 	if err != nil {
 		return nil, err
@@ -100,8 +100,8 @@ func (latencies *latencyFile) close() error {
 	return latencies.file.Close()
 }
 
-// waitForStopAndQuiet flushes the file every second and returns once a stop was requested (SIGTERM or Ctrl-C)
-// and no message arrived for quietSecondsBeforeExit seconds.
+// waitForStopAndQuiet writes the file to disk each second. It returns after a stop request (SIGTERM or Ctrl-C)
+// and quietSecondsBeforeExit seconds without a message.
 func waitForStopAndQuiet(latencies *latencyFile) {
 	stopSignal := make(chan os.Signal, 1)
 	signal.Notify(stopSignal, syscall.SIGTERM, os.Interrupt)
