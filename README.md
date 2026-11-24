@@ -28,7 +28,7 @@ The test file controls every setting of a run. Modify it to change the test.
 
 - **Network profile**: set `QDISC` on the publisher link, at both endpoints. `lan` has no impairment. Other profiles (4g, 3g, satellite-geo, wifi-bad) use netem; their sources are listed in the file.
 - **Broker queue**: `BROKER_QUEUE_SIZE` sets the size of the outgoing queue for each client.
-- **Address change test**: `examples/*-move.env` files. Publishers move their source address twice during a run. QUIC migrates the connection; TLS reconnects.
+- **Address change test**: `examples/*-move.env` files. Publishers move their source address at the times in `MOVE_AT_SECONDS` (at most three moves). QUIC migrates the connection; TLS reconnects.
 
 ## Result files
 

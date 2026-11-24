@@ -14,22 +14,21 @@ Limitations, exceptions, and particular benchmark settings, with the explanation
 ## Broker outbound queue
 
 - mochi-mqtt gives each client an outbound queue of `BROKER_QUEUE_SIZE` messages. Because the subscriber receives every message from every publisher, a small queue fills up at scale, causing the broker to disconnect the subscriber or drop messages.
-- The methodology tests use `1048576` (`1 << 20`), as in night 3.
-- mochi-mqtt provides equal capacity to all clients, including publishers: 8 MiB per client at `1 << 20`. This memory becomes resident after a reconnection, but not after the first connection. With `1 << 20` and 5000 TLS reconnections, the broker reached 7 GiB, and the kernel terminated it (out of memory, exit 137).
-- The address change test uses `65536`. With 5000 publishers, the TLS broker remained at roughly 3 GiB. `8192` is insufficient because a move caused the subscriber queue to overflow (QUIC, 4g, 2500 publishers: 55852 messages dropped).
+- The methodology tests use `1048576` (`1 << 20`).
+- mochi-mqtt provides equal capacity to all clients, including publishers: 8 MiB per client at `1 << 20`. This memory becomes resident after a reconnection, but not after the first connection, so the address change test uses a smaller queue.
+- The address change test uses `65536`.
 - When the count changes, the broker logs `messages dropped N` and writes the total to `broker-messages-dropped`. A valid run has 0 dropped messages.
 
 ## Publisher addresses
 
 - Each publisher binds to its own source address. A local route allows it to bind to any address in a block without adding each address individually.
 - Direct (methodology tests): the block is on the publisher network, so the broker maintains one neighbour (ARP) entry per publisher. The host’s neighbour table holds about 8192 entries, limiting each run to 8000 publishers.
-- Routed (address-change test): the block is outside the networks. The broker routes the entire block to the publisher container, so it maintains only one neighbour entry. Each publisher can use three addresses: the initial address and two subsequent moves.
-- Night 3 added each address as an alias on the interface. This repository uses a local route instead. From the broker’s perspective, the result is the same: one neighbour entry per publisher on the same network.
+- Routed (address-change test): the block is outside the networks. The broker routes the entire block to the publisher container, so it maintains only one neighbour entry. Each publisher can use four addresses: the initial address and three moves.
 
 ## Address change test
 
 - At move k, publisher i moves to the first address + i + 16384 × k. Each move uses a separate /18 block.
-- At most two moves are allowed: in quic-go 0.63, the server does not retire the connection ID of an abandoned path. On the third migration, it therefore had no free connection ID and ignored the new path. This limit has not yet been measured on quic-go 0.66.
+- At most three moves: the routed `/16` has four `/18` blocks (start and three moves).
 - All publishers move at the same time: a single goroutine signals each move.
 - TLS move: the TCP socket’s deadline is set in the past, causing every read and write to fail. Calling Close does not work: Paho ignores the "use of closed network connection" error because it expects that error after its own Close.
 - Old addresses (`DROP_OLD_ADDRESSES`): tc filters on `pub0` drop packets to and from the previous block. tc drops packets after they leave the socket, so the sender receives no error, as on a real network. An nftables drop returns EPERM to `sendmsg`, and quic-go closes the connection after a send error. This causes QUIC migration to fail for a reason that would not occur on a real network.
@@ -37,10 +36,10 @@ Limitations, exceptions, and particular benchmark settings, with the explanation
 
 ## QUIC
 
-- quic-go is at v0.66.0. In v0.63.0, migration with the old address dropped stalled permanently on the second move: the client answered the broker’s PATH_CHALLENGE on the old path, so the response was lost and the connection IDs ran out. v0.66.0 responds on the path where the challenge arrived.
+- quic-go is v0.66.0: the client answers a PATH_CHALLENGE on the path where it arrived, which a migration with the old address dropped needs.
 - The first bidirectional stream opened by the client carries the MQTT connection.
 - quic-go rejects a connection after the handshake completes if its accept queue (32 entries) is full. A single accept loop cannot drain the queue during a connection storm, so the broker runs several loops in parallel.
-- `quic.Dial` uses zero-length connection IDs, which prevent migration. Only `MOVE_MODE=migrate` dials with 4-byte connection IDs, so the other runs retain the bytes-per-message figures from night 3.
+- `quic.Dial` uses zero-length connection IDs, which prevent migration. Only `MOVE_MODE=migrate` dials with 4-byte connection IDs, so the other runs keep zero-length connection IDs.
 - 0-RTT: the broker accepts early data (`Allow0RTT`). A client sends its MQTT CONNECT as early data only when `ZERO_RTT=true` and it has a session ticket from an earlier connection. Therefore, only reconnections can use 0-RTT.
 - Each publisher retains its TLS session tickets, allowing TLS or QUIC reconnections to resume the session using PSK without sending the certificate.
 
