@@ -2,13 +2,18 @@
 """Usage: ./summarize.py <results folder>...      for example: ./summarize.py results/*
 
 Prints one csv row for each run, with the numbers that the paper reports. It reads only the files of a run:
-pub.txt and pub.csv (gen pub), sub.csv (gen sub), broker-cpu.stat, broker-snmp and broker-dev (broker).
+pub.txt and pub.csv (gen pub), sub.csv (gen sub), broker-messages-dropped, broker-cpu.stat,
+broker-snmp and broker-dev (broker).
 
 A run is valid when:
   - all messages of the steady phase arrived,
   - no more messages arrived than were offered (more messages are duplicates),
   - all publishers connected,
-  - the time limit did not stop the run.
+  - the time limit did not stop the run,
+  - the broker dropped no message (a full outbound queue drops messages).
+In an address change run (move_at not empty), the delivery is a result and not a condition:
+TLS loses or repeats messages when it reconnects. Such a run is valid when all publishers connected,
+the time limit did not stop the run, the broker dropped no message, and move.csv and reconnect.csv exist.
 The script also summarizes failed runs, because saturated runs are part of the results.
 """
 
@@ -22,11 +27,13 @@ COLUMNS = [
     "publishers",
     "message_rate",
     "payload_size",
+    "move_at",
     "received",
     "expected",
     "offered",
     "delivered_percent",
     "connect_failed",
+    "broker_messages_dropped",
     "cut",
     "valid",
     "latency_p50_ms",
@@ -59,6 +66,12 @@ def read_column(path, column):
     """The integer values of one csv column, sorted."""
     with open(path) as file:
         return sorted(int(row[column]) for row in csv.DictReader(file))
+
+
+def broker_messages_dropped(folder):
+    """Messages the broker dropped because the outbound queue of a client was full."""
+    with open(os.path.join(folder, "broker-messages-dropped")) as file:
+        return int(file.read())
 
 
 def broker_cpu_seconds(folder):
@@ -107,6 +120,21 @@ def summarize(folder):
     offered = publishers * message_rate * (steady_seconds + padding_seconds)
     connect_failed = int(settings["connect_failed"])
     cut = settings["cut"] == "true"
+    dropped = broker_messages_dropped(folder)
+    move_at = settings.get("move_at", "")
+    if move_at:
+        address_change_files = ("move.csv", "reconnect.csv")
+        all_files = all(
+            os.path.exists(os.path.join(folder, name)) for name in address_change_files
+        )
+        valid = connect_failed == 0 and not cut and dropped == 0 and all_files
+    else:
+        valid = (
+            expected <= received <= offered
+            and connect_failed == 0
+            and not cut
+            and dropped == 0
+        )
     link_bytes = publisher_link_bytes(folder)
     bytes_per_message = (
         round(link_bytes / received) if link_bytes and received else None
@@ -118,13 +146,15 @@ def summarize(folder):
         "publishers": publishers,
         "message_rate": message_rate,
         "payload_size": settings["payload_size"],
+        "move_at": move_at,
         "received": received,
         "expected": expected,
         "offered": offered,
         "delivered_percent": round(100 * received / offered, 2),
         "connect_failed": connect_failed,
+        "broker_messages_dropped": dropped,
         "cut": cut,
-        "valid": expected <= received <= offered and connect_failed == 0 and not cut,
+        "valid": valid,
         "latency_p50_ms": percentile(latencies, 50),
         "latency_p95_ms": percentile(latencies, 95),
         "latency_p99_ms": percentile(latencies, 99),
@@ -145,5 +175,6 @@ if __name__ == "__main__":
     for folder in sys.argv[1:]:
         try:
             writer.writerow(summarize(folder))
-        except FileNotFoundError as missing:
-            print(f"skipping {folder}: {missing.filename} is missing", file=sys.stderr)
+        # not a run folder, or a run that did not write its files
+        except OSError as error:
+            print(f"skipping {folder}: {error}", file=sys.stderr)

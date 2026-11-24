@@ -26,9 +26,15 @@ var brokerPorts = map[string]string{"tls": "8883", "quic": "14567"}
 type brokerDialer struct {
 	transport     string
 	brokerAddress string // host:port
-	sourceAddress net.IP // local address to bind; nil = the kernel selects
 	tlsConfig     *tls.Config
+	movable       bool         // QUIC: the connection must be able to migrate (address change test)
 	handshake     atomic.Int64 // nanoseconds
+
+	lock           sync.Mutex
+	sourceAddress  net.IP     // local address to bind; nil = the kernel selects; move changes it
+	tcpConnection  net.Conn   // TCP connection under the last TLS connection
+	quicConnection *quic.Conn // last QUIC connection
+	movedPath      *quic.Path // QUIC path in use after the last move
 }
 
 func newBrokerDialer(transport, brokerHost string, sourceAddress net.IP) (*brokerDialer, error) {
@@ -71,6 +77,12 @@ func (dialer *brokerDialer) handshakeTime() time.Duration {
 	return time.Duration(dialer.handshake.Load())
 }
 
+func (dialer *brokerDialer) currentSourceAddress() net.IP {
+	dialer.lock.Lock()
+	defer dialer.lock.Unlock()
+	return dialer.sourceAddress
+}
+
 // open gives Paho the network connection for MQTT.
 func (dialer *brokerDialer) open(*url.URL, mqtt.ClientOptions) (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
@@ -83,7 +95,7 @@ func (dialer *brokerDialer) open(*url.URL, mqtt.ClientOptions) (net.Conn, error)
 
 func (dialer *brokerDialer) openTLS(ctx context.Context) (net.Conn, error) {
 	start := time.Now()
-	tcpDialer := net.Dialer{LocalAddr: &net.TCPAddr{IP: dialer.sourceAddress}}
+	tcpDialer := net.Dialer{LocalAddr: &net.TCPAddr{IP: dialer.currentSourceAddress()}}
 	tcpConnection, err := tcpDialer.DialContext(ctx, "tcp4", dialer.brokerAddress)
 	if err != nil {
 		return nil, err
@@ -94,6 +106,9 @@ func (dialer *brokerDialer) openTLS(ctx context.Context) (net.Conn, error) {
 		return nil, err
 	}
 	dialer.handshake.Store(int64(time.Since(start)))
+	dialer.lock.Lock()
+	dialer.tcpConnection = tcpConnection
+	dialer.lock.Unlock()
 	return tlsConnection, nil
 }
 
@@ -104,20 +119,31 @@ func (dialer *brokerDialer) openQUIC(ctx context.Context) (net.Conn, error) {
 		return nil, err
 	}
 	// shortcut: the UDP socket stays open after the connection closes. There is one socket for each publisher; the process frees them when it exits.
-	udpSocket, err := net.ListenUDP("udp4", &net.UDPAddr{IP: dialer.sourceAddress})
+	udpSocket, err := net.ListenUDP("udp4", &net.UDPAddr{IP: dialer.currentSourceAddress()})
 	if err != nil {
 		return nil, err
 	}
-	quicConnection, err := quic.Dial(ctx, udpSocket, brokerUDPAddress, dialer.tlsConfig, &quic.Config{
+	quicConfig := &quic.Config{
 		HandshakeIdleTimeout: connectTimeout,
 		MaxIdleTimeout:       120 * time.Second,
 		KeepAlivePeriod:      15 * time.Second,
-	})
+	}
+	var quicConnection *quic.Conn
+	if dialer.movable {
+		// quic.Dial uses connection IDs of zero length, and a connection without an ID cannot migrate.
+		transport := &quic.Transport{Conn: udpSocket, ConnectionIDLength: 4}
+		quicConnection, err = transport.Dial(ctx, brokerUDPAddress, dialer.tlsConfig, quicConfig)
+	} else {
+		quicConnection, err = quic.Dial(ctx, udpSocket, brokerUDPAddress, dialer.tlsConfig, quicConfig)
+	}
 	if err != nil {
 		udpSocket.Close()
 		return nil, err
 	}
-	dialer.handshake.Store(int64(time.Since(start))) // quic.Dial returns when the handshake is complete
+	dialer.handshake.Store(int64(time.Since(start))) // Dial returns when the handshake is complete
+	dialer.lock.Lock()
+	dialer.quicConnection = quicConnection
+	dialer.lock.Unlock()
 
 	// the first bidirectional stream from the client carries the MQTT connection
 	stream, err := quicConnection.OpenStreamSync(ctx)
@@ -144,8 +170,9 @@ func (stream quicStreamConn) Close() error {
 }
 
 // newMQTTClient returns a Paho client that connects through dialer. The client does not reconnect
-// and does not retry a connection. Thus, each failed connection counts.
-func newMQTTClient(dialer *brokerDialer, clientID string, onMessage mqtt.MessageHandler) mqtt.Client {
+// and does not retry a connection. Thus, each failed connection counts. configure can change these options,
+// for example to reconnect in the address change test.
+func newMQTTClient(dialer *brokerDialer, clientID string, onMessage mqtt.MessageHandler, configure ...func(*mqtt.ClientOptions)) mqtt.Client {
 	options := mqtt.NewClientOptions().
 		AddBroker("tcp://" + dialer.brokerAddress). // only a label: dialer.open makes the connection
 		SetClientID(clientID).
@@ -160,6 +187,9 @@ func newMQTTClient(dialer *brokerDialer, clientID string, onMessage mqtt.Message
 		SetCustomOpenConnectionFn(dialer.open)
 	if onMessage != nil {
 		options.SetDefaultPublishHandler(onMessage)
+	}
+	for _, change := range configure {
+		change(options)
 	}
 	return mqtt.NewClient(options)
 }

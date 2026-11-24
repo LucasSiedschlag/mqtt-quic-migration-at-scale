@@ -9,6 +9,10 @@
 # Without "distribution", the jitter is uniform in MEAN +/- JITTER. With "distribution normal", sigma is JITTER.
 # There is no link rate. The benchmark measures the bandwidth.
 
+# Routed addresses, for the address change test (MOVE_AT): the publisher container owns all of
+# ROUTED_ADDRESSES, and the broker routes them to PUBLISHER_CONTAINER_ADDRESS. Thus, each publisher can
+# use two addresses without a neighbour entry for each address. The other tests do not use these routes.
+
 x-node: &node
   build: .
   image: mqtt-tls-vs-quic
@@ -26,7 +30,10 @@ services:
       subscriber: {interface_name: sub0}
     cap_add: [NET_ADMIN]
     ulimits: {nofile: 1048576}
-    command: sh -c "tc qdisc replace dev pub0 root ${QDISC} && exec broker -out /results"
+    command: >-
+      sh -c "ip route add ${ROUTED_ADDRESSES} via ${PUBLISHER_CONTAINER_ADDRESS} &&
+      tc qdisc replace dev pub0 root ${QDISC} &&
+      exec broker -max-pending ${MAX_PENDING} -out /results"
     healthcheck:
       test: ss -ltn | grep -q :8883
       interval: 1s
@@ -47,7 +54,7 @@ services:
   publisher:
     <<: *node
     networks:
-      publishers: {interface_name: pub0}
+      publishers: {interface_name: pub0, ipv4_address: "${PUBLISHER_CONTAINER_ADDRESS}"}
     cap_add: [NET_ADMIN]
     ulimits: {nofile: 1048576}
     depends_on:
@@ -56,10 +63,11 @@ services:
     # With this local route, each publisher can bind its own address in PUBLISHER_ADDRESSES.
     command: >-
       sh -c "ip route add local ${PUBLISHER_ADDRESSES} dev pub0 &&
+      ip route add local ${ROUTED_ADDRESSES} dev lo &&
       tc qdisc replace dev pub0 root ${QDISC} &&
       exec gen pub -transport ${TRANSPORT} -c ${PUBLISHERS} -R ${CONNECT_RATE} -rate ${MESSAGE_RATE}
       -s ${PAYLOAD_SIZE} -prefix ${TOPIC_PREFIX} -steady ${STEADY_SECONDS} -pad ${PADDING_SECONDS}
-      -bind ${FIRST_PUBLISHER_ADDRESS} -out /results"
+      -bind ${FIRST_PUBLISHER_ADDRESS} -move=${MOVE_AT} -out /results"
 
   # Optional: set COMPOSE_PROFILES=capture in the test file. tcpdump runs in the network namespace
   # of the broker and keeps the first CAPTURE_PACKETS packets on the MQTT ports.

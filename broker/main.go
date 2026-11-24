@@ -15,7 +15,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	mochi "github.com/mochi-mqtt/server/v2"
 	"github.com/mochi-mqtt/server/v2/hooks/auth"
@@ -46,6 +48,7 @@ func main() {
 
 func runBroker() error {
 	countersDir := flag.String("out", "", "directory for the counters that the broker saves when it stops (empty = no counters)")
+	maxPending := flag.Int("max-pending", 1<<20, "capacity of the outbound queue of each client, in messages")
 	flag.Parse()
 
 	tlsConfig, err := loadTLSConfig()
@@ -55,7 +58,7 @@ func runBroker() error {
 	quicTLSConfig := tlsConfig.Clone()
 	quicTLSConfig.NextProtos = []string{"mqtt"} // ALPN of MQTT over QUIC
 
-	server := newMQTTServer()
+	server := newMQTTServer(*maxPending)
 	if err := server.AddHook(new(auth.AllowHook), nil); err != nil {
 		return err
 	}
@@ -69,10 +72,11 @@ func runBroker() error {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "listening tls=%s quic=%s\n", tlsAddress, quicAddress)
+	go logDroppedMessages(server)
 
 	waitForStopSignal()
 	if *countersDir != "" {
-		saveCounters(*countersDir)
+		saveCounters(*countersDir, server)
 	}
 	return server.Close()
 }
@@ -89,11 +93,16 @@ func loadTLSConfig() (*tls.Config, error) {
 	}, nil
 }
 
-func newMQTTServer() *mochi.Server {
+// newMQTTServer makes the mochi-mqtt server. maxPending is the capacity of the outbound queue of each client.
+//
+// The subscriber receives all messages from all publishers. At scale, the default limits fill its
+// outbound queue and its in-flight window. Then the broker drops messages or disconnects the subscriber.
+// mochi-mqtt gives the same queue capacity to each client, the publishers too: 8 MiB per client at 1 << 20.
+// A first connection does not make this memory resident, but a reconnection does. Thus, the address change
+// test uses 65536: with 1 << 20, 5000 TLS reconnections fill the memory of the host.
+func newMQTTServer(maxPending int) *mochi.Server {
 	capabilities := mochi.NewDefaultServerCapabilities()
-	// The subscriber receives all messages from all publishers. At scale, the default limits
-	// fill its write queue and its in-flight window. Then the broker disconnects the subscriber.
-	capabilities.MaximumClientWritesPending = 1 << 20
+	capabilities.MaximumClientWritesPending = int32(maxPending)
 	capabilities.MaximumInflight = 65535
 	return mochi.New(&mochi.Options{
 		Capabilities: capabilities,
@@ -107,9 +116,26 @@ func waitForStopSignal() {
 	<-stopSignal
 }
 
-// saveCounters copies each counter file into dir as broker-<name>. A new container starts
-// these counters at zero. Thus, the copies contain the totals of one run.
-func saveCounters(dir string) {
+// logDroppedMessages writes "messages dropped N" each second when N changes. mochi-mqtt drops a message
+// when the outbound queue of a client is full. A valid run has 0 dropped messages.
+func logDroppedMessages(server *mochi.Server) {
+	var logged int64
+	for range time.Tick(time.Second) {
+		if dropped := atomic.LoadInt64(&server.Info.MessagesDropped); dropped != logged {
+			fmt.Fprintf(os.Stderr, "messages dropped %d\n", dropped)
+			logged = dropped
+		}
+	}
+}
+
+// saveCounters copies each counter file into dir as broker-<name>, and writes the number of dropped
+// messages to broker-messages-dropped. A new container starts these counters at zero.
+// Thus, the files contain the totals of one run.
+func saveCounters(dir string, server *mochi.Server) {
+	dropped := fmt.Sprintf("%d\n", atomic.LoadInt64(&server.Info.MessagesDropped))
+	if err := os.WriteFile(filepath.Join(dir, "broker-messages-dropped"), []byte(dropped), 0o644); err != nil {
+		fmt.Fprintln(os.Stderr, "saving counters:", err)
+	}
 	for _, source := range counterFiles {
 		content, err := os.ReadFile(source)
 		if err == nil {
