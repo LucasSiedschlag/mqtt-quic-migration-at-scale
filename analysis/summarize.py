@@ -34,6 +34,7 @@ COLUMNS = [
     "connect_p95_ms",
     "broker_cpu_seconds",
     "broker_udp_errors",
+    "broker_memory_peak_mib",
     "publisher_link_bytes_per_message",
     "outage_p50_ms",
     "outage_p95_ms",
@@ -82,6 +83,14 @@ def broker_udp_errors(folder):
         udp_lines = [line.split()[1:] for line in file if line.startswith("Udp:")]
     names, values = udp_lines  # first line: counter names; second line: counter values
     return int(dict(zip(names, values))["InErrors"])
+
+
+def broker_memory_peak_mib(folder):
+    path = os.path.join(folder, "broker-memory.peak")
+    if not os.path.exists(path):  # runs before the broker saved it
+        return None
+    with open(path) as file:
+        return round(int(file.read()) / 2**20)
 
 
 def publisher_link_bytes(folder):
@@ -178,6 +187,7 @@ def summarize(folder):
         "connect_p95_ms": percentile(connects, 95),
         "broker_cpu_seconds": broker_cpu_seconds(folder),
         "broker_udp_errors": broker_udp_errors(folder),
+        "broker_memory_peak_mib": broker_memory_peak_mib(folder),
         "publisher_link_bytes_per_message": bytes_per_message,
         "outage_p50_ms": percentile(outages, 50),
         "outage_p95_ms": percentile(outages, 95),

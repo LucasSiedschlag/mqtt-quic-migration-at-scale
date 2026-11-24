@@ -37,7 +37,7 @@ Each run writes its output to the `RESULTS_FOLDER` specified in the test file:
 - `sub.csv`: one row per message received, along with its latency.
 - `pub.csv`: one row per publisher, containing handshake and connect times.
 - `pub.txt`: run settings and final counters.
-- `broker-*`: broker CPU usage, UDP counters, interface traffic and dropped messages.
+- `broker-*`: broker CPU usage, peak memory, UDP counters, interface traffic and dropped messages.
 - `move.csv`, `reconnect.csv`: generated only during the address change test.
 - `broker.pcap`, `keys.log`: created only if the capture is enabled.
 
@@ -51,7 +51,7 @@ A run is considered valid if every steady-phase message was delivered, all publi
 - **Delivery metrics**: count of `received`, `expected` and `offered` messages, and `delivered_percent`.
 - **Latency**: `latency_p50_ms` to `latency_max_ms`, measured from send to receive. The tail (p99, max) reveals stalls.
 - **Connection setup**: `handshake_p50_ms` (time for TLS or QUIC handshake) and `connect_p95_ms` (time until MQTT CONNACK).
-- **Resource consumption**: `publisher_link_bytes_per_message` (bidirectional, including handshakes), `broker_cpu_seconds` and `broker_udp_errors` (UDP datagrams dropped by the kernel).
+- **Resource consumption**: `publisher_link_bytes_per_message` (bidirectional, including handshakes), `broker_cpu_seconds`, `broker_memory_peak_mib` and `broker_udp_errors` (UDP datagrams dropped by the kernel).
 
 In the address change test, the summary also reads the additional CSV files:
 

@@ -29,9 +29,10 @@ const (
 )
 
 var counterFiles = []string{
-	"/proc/net/snmp",          // kernel UDP counters, with receive errors
-	"/proc/net/dev",           // bytes and packets of each network interface
-	"/sys/fs/cgroup/cpu.stat", // CPU time of the container
+	"/proc/net/snmp",             // kernel UDP counters, with receive errors
+	"/proc/net/dev",              // bytes and packets of each network interface
+	"/sys/fs/cgroup/cpu.stat",    // CPU time of the container
+	"/sys/fs/cgroup/memory.peak", // highest memory use of the container, in bytes
 }
 
 func main() {
