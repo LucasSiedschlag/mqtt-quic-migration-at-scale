@@ -1,88 +1,68 @@
 # mqtt-tls-vs-quic-at-scale
 
-MQTT over TCP + TLS 1.3 against MQTT over QUIC, with many publishers, in containers.
-The broker, the client and the load are the same for the two transports. Only the transport changes.
+MQTT over TCP + TLS 1.3 vs. MQTT over QUIC, with many publishers, inside containers. Same broker, client and load for both transports.
 
-## What a run does
+## How a run works
 
-Three containers start in this order:
+1. **Broker**: starts `mochi-mqtt` with TLS 1.3 over TCP on port 8883, and MQTT over QUIC on UDP port 14567 (quic-go). Both listeners share the same `crypto/tls` config in Go.
+2. **Subscriber**: runs one MQTT client on `bench/#`, on a separate network without any netem. It logs the latency for every message it receives.
+3. **Publishers**: all run inside a single container. Each publisher gets its own connection, topic and source address. Publishers connect at a constant rate, then each publishes QoS 1 messages for 30 s, plus 3 s of padding.
 
-1. **Broker**: mochi-mqtt with TLS 1.3 on TCP 8883 and MQTT over QUIC on UDP 14567 (quic-go).
-   The two listeners use the same Go `crypto/tls` configuration.
-2. **Subscriber**: one MQTT client on `bench/#`, on its own network without netem.
-   It records the latency of each message.
-3. **Publishers**: all in one container. Each publisher has its own connection, topic and source address.
-   They connect at a fixed rate, then each one sends QoS 1 messages for 30 s, plus 3 s of padding.
+The run finishes as soon as all publishers complete, then the broker dumps its counters to disk.
 
-The run stops when the publishers finish. The broker then saves its counters.
+## Repo layout
 
-## Repository
-
-| path | content |
+| path | what it contains |
 | --- | --- |
 | `broker/` | the MQTT broker |
-| `gen/` | the load generator: `gen pub` (publishers) and `gen sub` (subscriber), on Eclipse Paho |
-| `compose.yaml` | the three containers, their networks and the optional packet capture |
-| `examples/` | one test per file: transport, publishers, message rate, payload size, network profile |
-| `certs.sh` | makes the certificate of the broker |
-| `summarize.py` | one csv row per run, with the numbers of the paper |
+| `gen/` | load generator: `gen pub` (publishers) and `gen sub` (subscriber), on Paho |
+| `compose.yaml` | defines the three containers, their networks and the packet capture (optional) |
+| `examples/` | one test per file and network profile: `<profile>.env` (methodology tests) and `<profile>-move.env` (address change); `_template.env` lists every parameter for you to copy and adjust |
+| `certs.sh` | generates the broker's certificate |
+| `analysis/` | Python scripts to process results: `summarize.py` outputs one CSV row per run, with the figures referenced in the paper |
+| `DETAILS.md` | describes constraints, edge cases and specific settings, explaining the why behind each choice |
 
-## Test files
+## Test file
 
-A test file holds all the settings of one run. Edit it to change the test.
+The test file controls every setting of a run. Modify it to change the test.
 
-- **Network profile**: `QDISC` goes on the publisher link, at the two ends. `lan` has no impairment.
-  The other profiles (4g, 3g, satellite-geo, wifi-bad) use netem, with their sources in the file.
-- **Broker queue**: `MAX_PENDING` is the capacity of the outbound queue of each client.
-- **Address change test**: `examples/lan-move.env`. Each publisher moves to a new source address two times.
-  QUIC migrates its connection; TLS reconnects.
+- **Network profile**: set `QDISC` on the publisher link, at both endpoints. `lan` has no impairment. Other profiles (4g, 3g, satellite-geo, wifi-bad) use netem; their sources are listed in the file.
+- **Broker queue**: `BROKER_QUEUE_SIZE` sets the size of the outgoing queue for each client.
+- **Address change test**: `examples/*-move.env` files. Publishers move their source address twice during a run. QUIC migrates the connection; TLS reconnects.
 
-## Results
+## Result files
 
-The results of a run go to the `RESULTS` folder of its test file:
+Each run writes its output to the `RESULTS_FOLDER` specified in the test file:
 
-- `sub.csv`: one row for each received message, with its latency.
-- `pub.csv`: one row for each publisher, with the handshake and connect times.
-- `pub.txt`: the settings of the run and the final counters.
-- `broker-*`: CPU time, UDP counters, interface bytes and dropped messages of the broker.
-- `move.csv`, `reconnect.csv`: only in the address change test.
-- `broker.pcap`, `keys.log`: only with the capture.
+- `sub.csv`: one row per message received, along with its latency.
+- `pub.csv`: one row per publisher, containing handshake and connect times.
+- `pub.txt`: run settings and final counters.
+- `broker-*`: broker CPU usage, UDP counters, interface traffic and dropped messages.
+- `move.csv`, `reconnect.csv`: generated only during the address change test.
+- `broker.pcap`, `keys.log`: created only if the capture is enabled.
 
-A run is valid when all messages of the steady phase arrived, all publishers connected,
-the time limit did not stop the run and the broker dropped no message.
-In the address change test the delivery is a result, not a condition: TLS loses or repeats messages when it reconnects.
+A run is considered valid if every steady-phase message was delivered, all publishers connected, the time limit was not hit and the broker did not drop any message. For the address change test, full delivery is not required, since TLS can lose or duplicate messages during reconnection.
 
-## Analyze the results
+## Process the results
 
-`./summarize.py results/*` prints one csv row per run. Compare a TLS run and a QUIC run of the same test:
+`./analysis/summarize.py results/*` prints one CSV row per run. Compare a TLS run to a QUIC run within the same test:
 
-- **Validity first**: use only rows with `valid` = True. A row with `cut` = True shows saturation:
-  the time limit stopped the run, and `delivered_percent` shows how much arrived.
-- **Delivery**: `received`, `expected` and `offered` messages, and `delivered_percent`.
-- **Latency**: `latency_p50_ms` to `latency_max_ms`, from send to receive. The tail (p99, max) shows the stalls.
-- **Connection setup**: `handshake_p50_ms` (TLS or QUIC handshake) and `connect_p95_ms` (until the MQTT CONNACK).
-- **Cost**: `publisher_link_bytes_per_message` (both directions, handshakes included),
-  `broker_cpu_seconds` and `broker_udp_errors` (UDP datagrams that the kernel dropped).
+- **First filter by validity**: select only rows where `valid` = True. A row with `cut` = True indicates saturation: the time limit ended the run, and `delivered_percent` shows how much of the traffic got through.
+- **Delivery metrics**: count of `received`, `expected` and `offered` messages, and `delivered_percent`.
+- **Latency**: `latency_p50_ms` to `latency_max_ms`, measured from send to receive. The tail (p99, max) reveals stalls.
+- **Connection setup**: `handshake_p50_ms` (time for TLS or QUIC handshake) and `connect_p95_ms` (time until MQTT CONNACK).
+- **Resource consumption**: `publisher_link_bytes_per_message` (bidirectional, including handshakes), `broker_cpu_seconds` and `broker_udp_errors` (UDP datagrams dropped by the kernel).
 
-For the address change test, read the two extra files:
+In the address change test, examine the additional CSV files:
 
-- `move.csv`: `DoneMs - StartMs` is the QUIC migration time of each publisher. TLS rows have no `DoneMs`.
-- `reconnect.csv`: `ReconnectedMs - LostMs` is the TLS outage of each publisher. `ReconnectedMs` = 0 means no reconnection.
+- `move.csv`: `DoneMs - StartMs` represents the time each publisher took to migrate its QUIC connection. TLS connections do not have a `DoneMs`.
+- `reconnect.csv`: `ReconnectedMs - LostMs` is the duration of each publisher's TLS disconnection. If `ReconnectedMs` = 0, the publisher did not reconnect.
 
-In Wireshark, open `broker.pcapng`:
+See [DETAILS.md](DETAILS.md) for a list of limitations, Wireshark configuration and explanations for specific settings.
 
-- For TLS, turn on the TCP preference "Reassemble out-of-order segments" (`tcp.reassemble_out_of_order`).
-- Wireshark counts retransmitted QUIC STREAM data two times in the MQTT counts.
-- The capture keeps UDP segmentation offload on, so some broker-to-subscriber QUIC datagrams are too large to decode.
+## Execute a test
 
-## Limits
-
-- At most 8000 publishers: the neighbour table of the host has about 8192 entries.
-- At most two moves in the address change test: at a third migration, the quic-go server has no free connection ID.
-
-## Run a test
-
-1. Make the certificate (one time):
+1. Generate the certificate (once):
    ```sh
    ./certs.sh
    ```
@@ -90,14 +70,15 @@ In Wireshark, open `broker.pcapng`:
    ```sh
    docker compose --env-file examples/lan.env up --build --exit-code-from publisher
    ```
-3. Run it again with `TRANSPORT=tls` in the file.
-4. Capture: set `COMPOSE_PROFILES=capture` and `TLS_KEY_LOG=/results/keys.log` in the file.
-5. Wireshark: put the keys in the capture, then open `broker.pcapng`:
+3. Repeat the test with `TRANSPORT=tls` in the file.
+4. Capture: remove the `#` of the three capture lines in the file.
+5. Add the TLS keys to the capture and inspect it in Wireshark:
    ```sh
    cd results/quic-200-lan
    editcap --inject-secrets tls,keys.log broker.pcap broker.pcapng
+   open broker.pcapng
    ```
-6. Summary, one row per run:
+6. Print a summary, one row per run:
    ```sh
-   ./summarize.py results/*
+   ./analysis/summarize.py results/*
    ```
