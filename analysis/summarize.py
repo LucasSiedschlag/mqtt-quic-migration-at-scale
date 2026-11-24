@@ -35,6 +35,13 @@ COLUMNS = [
     "broker_cpu_seconds",
     "broker_udp_errors",
     "publisher_link_bytes_per_message",
+    "outage_p50_ms",
+    "outage_p95_ms",
+    "outage_p99_ms",
+    "not_reconnected",
+    "migration_p50_ms",
+    "migration_p95_ms",
+    "migration_p99_ms",
 ]
 
 
@@ -87,6 +94,27 @@ def publisher_link_bytes(folder):
     return None
 
 
+def address_change_times(folder):
+    """Outage times (reconnect.csv), the count of publishers that did not reconnect, and migration times (move.csv), in ms."""
+    outages, not_reconnected, migrations = [], 0, []
+    reconnect_path = os.path.join(folder, "reconnect.csv")
+    if os.path.exists(reconnect_path):
+        with open(reconnect_path) as file:
+            for row in csv.DictReader(file):
+                if int(row["ReconnectedMs"]) == 0:
+                    not_reconnected += 1
+                else:
+                    outages.append(int(row["ReconnectedMs"]) - int(row["LostMs"]))
+    move_path = os.path.join(folder, "move.csv")
+    if os.path.exists(move_path):
+        with open(move_path) as file:
+            for row in csv.DictReader(file):
+                # TLS and QUIC reconnection rows have no DoneMs
+                if row["DoneMs"] and int(row["DoneMs"]) > 0:
+                    migrations.append(int(row["DoneMs"]) - int(row["StartMs"]))
+    return sorted(outages), not_reconnected, sorted(migrations)
+
+
 def summarize(folder):
     settings = read_settings(folder)
     publishers = int(settings["publishers"])
@@ -122,6 +150,7 @@ def summarize(folder):
     bytes_per_message = (
         round(link_bytes / received) if link_bytes and received else None
     )
+    outages, not_reconnected, migrations = address_change_times(folder)
 
     return {
         "run": os.path.basename(os.path.normpath(folder)),
@@ -150,6 +179,13 @@ def summarize(folder):
         "broker_cpu_seconds": broker_cpu_seconds(folder),
         "broker_udp_errors": broker_udp_errors(folder),
         "publisher_link_bytes_per_message": bytes_per_message,
+        "outage_p50_ms": percentile(outages, 50),
+        "outage_p95_ms": percentile(outages, 95),
+        "outage_p99_ms": percentile(outages, 99),
+        "not_reconnected": not_reconnected if move_at else None,
+        "migration_p50_ms": percentile(migrations, 50),
+        "migration_p95_ms": percentile(migrations, 95),
+        "migration_p99_ms": percentile(migrations, 99),
     }
 
 

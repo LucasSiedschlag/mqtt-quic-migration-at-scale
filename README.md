@@ -53,10 +53,11 @@ A run is considered valid if every steady-phase message was delivered, all publi
 - **Connection setup**: `handshake_p50_ms` (time for TLS or QUIC handshake) and `connect_p95_ms` (time until MQTT CONNACK).
 - **Resource consumption**: `publisher_link_bytes_per_message` (bidirectional, including handshakes), `broker_cpu_seconds` and `broker_udp_errors` (UDP datagrams dropped by the kernel).
 
-In the address change test, examine the additional CSV files:
+In the address change test, the summary also reads the additional CSV files:
 
-- `move.csv`: `DoneMs - StartMs` represents the time each publisher took to migrate its QUIC connection. TLS connections do not have a `DoneMs`.
-- `reconnect.csv`: `ReconnectedMs - LostMs` is the duration of each publisher's TLS disconnection. If `ReconnectedMs` = 0, the publisher did not reconnect.
+- `migration_p50_ms` to `migration_p99_ms`: from `move.csv`, `DoneMs - StartMs` is the time each publisher took to migrate its QUIC connection. Reconnection rows do not have a `DoneMs`.
+- `outage_p50_ms` to `outage_p99_ms`: from `reconnect.csv`, `ReconnectedMs - LostMs` is the time each publisher stayed without a connection when it reconnects (TLS, or QUIC with `MOVE_MODE=reconnect`).
+- `not_reconnected`: rows with `ReconnectedMs` = 0, the publisher did not reconnect.
 
 See [DETAILS.md](DETAILS.md) for a list of limitations, Wireshark configuration and explanations for specific settings.
 
